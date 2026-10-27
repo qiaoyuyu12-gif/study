@@ -1,0 +1,226 @@
+#一.提示词工程
+	role：什么类型的agent
+	scope：agent能力边界，用于做什么
+	goal：目标是什么，得到什么结果算任务结束
+	output constract：输出的内容格式约束，最好按照结构化json格式输出
+	tool policy：什么时候可以调用哪些tool，什么时候不能调用（使用harness加强约束）
+	decision：告诉agent如何决策下一步骤，什么情况下做什么（包含异常处理）
+	workflow：不能直接定义工作流，使用langgraph直接编排工作流调用
+	failure policy：执行失败处理措施
+	状态机：严格区分不知道、失败、空值、超时、限权、部分成功、成功（直接写到state）
+	few-shot：写一个短示例告诉agent具体完成一个任务该怎么做
+	工具描述：用途、使用条件、禁止、权限、幂等、失败策略
+
+注意要将提示词、state、context、memory记录区分
+	提示词：角色、规则、目标、边界范围
+	state：agent运行时发生变化的事实，如tool执行结果、message、任务状态
+	context：agent运行时不会被agent修改的，如用户id、session_id、权限、环境
+	记忆：用户偏好、用户画像、长期经验
+
+构建提示词评价体系
+测试集： 1.正常
+		2.不同条件路由测试
+		3.工具执行参数传递缺失
+		4.用户要求越权
+		5.重复请求
+		6.事实冲突
+		7.用户中途修改请求
+		8.恶意提示词注入
+测试提示词：
+		1.工具调用准确度
+		2.任务成功率
+		3.失败几率
+		4.指令遵循
+		5.平均步骤
+		6.token消耗
+
+提示词涉及一部分权限、能力范围约束、防提示词注入，但是约束LLM幻觉不能全靠提示词，更多的限制约束还是在harness中通过硬约束来实现
+
+OpenAI Agents SDK这个agent框架中：
+	动态提示函数 module-attribute
+	DynamicPromptFunction = Callable[
+	[GenerateDynamicPromptData], MaybeAwaitable[Prompt]
+]
+可以迅速动态生成提示词的函数
+LangChain开发框架中：
+	直接通过中间件实现动态提示词、tool选择，使用@dynamic_prompt根据上下文动态选择提示词
+
+用模型生成/优化提示词，如 OpenAI 的 prompt 优化、Anthropic 的 prompt improver
+
+
+
+二.上下文工程
+
+agent的上下文不是固定的，而是一次模型调用前根据prompt、state、context、memory动态构造，设计上下文分层runtime、task、state、events、knowledge、memory、tool results、conversation，每一个节点设计一个schema来声明自己需要什么，使用contextbulider创建满足schema的节点context
+
+A. Context Modeling：Schema、Context Type、 Context Item
+B. Context Assembly： ContextBuilder、 Node Requirements（node schema）
+C. Context Selection：Relevance、Priority、Filtering
+D. Context Retrieval：RAG、BM25、Vector、Meomry、DB
+E. Context Compression：Trim、Summarize、Microcompact、Collapse、Compaction
+F. Context Externalization：DB、Object Storage、File、Memory Store
+G. Context Isolation：User、Session、Task、Agent、SubAgent
+H. Context Security：Permission、 PII、Injection、Tenant
+I. Context Governance：Version、TTL、Source、Confidence、Conflict
+J. Context Observability：Token、Source、Build、Compression、Retrieval、Final Context
+
+context的大致分类：
+	1.runtime context：执行过程中基本不变user_id,tenant_id,session_id,request_id,agent_id,permissions等；
+	2.task context：query、demand_calculation、completed_step、pending_step等从用户提示词、state动态拼接的上下文，常在node执行后更新内容，大部分使用state中内容构建；
+	3.konwledge context：这一类上下文来源于外部的知识库，直接根据用户query检索相关的文本块
+	4.memory context：从外部的memory中加载与问题相关的内容写入context
+模型为了完成这一步的操作需要什么上下文信息，创建一个ContextBulider按照节点schema声明拼接节点context
+
+构建上下文注意点：
+	1.严格区分state、context、memory，状态信息、tool结果存入state，从state和task context 两者中拼接出工作上下文；
+	2.建立context policy根据权限约束什么内容可以进入上下文，防止用户使用agent做越权操作、信息获取；
+	3.每个执行节点contextbulider按照节点schema构建节点context；
+	4.可以从rag、memory、DB中检索内容整理到knowledge context中；
+	5.构建context budget来判断优先级做上下文压缩、裁剪、删除、存储到外部；
+	6.上下文隔离策略，按照agent、user、session-id字段来隔离上下文；
+	7.上下文可观测性，拼接上下文必须明确来源；
+	8.context中必须待时间戳来保证context中信息的有效性，判断数据是否过期；
+	9.上下文冲突策略，memory中a=100，RAG知识库中a=150,ERP库存中a=200，所以在contextbulider构建的时候确定数据源的优先级，并反馈出冲突点；
+	10.中断后上下文恢复，设置检查点，中断后恢复读取检查点恢复state，重新注入runtime context并使用contextbulider构建节点上下文，绝对不能直接恢复旧context
+
+传统的langchain处理上下文：
+策略1：将所有状态全部写到上下文外部，再选择写入上下文窗口中
+	memory长期记忆可以选择存储到向量库、python进程中，用ID引用
+	state按照session_id记录到向量库、进程中
+	超长内容存到文件中，模型只存有文件路径
+	工具执行结果直接按照json格式化存储记录
+	每次调用模型执行的节点使用新的context控制填入上下文窗口	
+策略2：搜索写入上下文
+	使用RAG、BM25、embedding模型通过相似度判断与问题相关的内容召回到上下文窗口中
+	store = InMemoryStore(
+    index={
+        "embed": embeddings,
+        "dims": 1536,
+   	 }
+	)
+	tool工具描述同样通过功能分组来控制写入上下文（skill）
+策略3：压缩上下文
+	LLM直接压缩上下文，例如langchain中的SummarizationMiddleware中间件直接对上下文进行摘要
+	tool调用过滤，直接过滤掉过程中tool call、tool result
+	结构化裁剪，只保留每次对话的quest和answer
+	上下文裁剪，直接粗暴的使用trim_messages裁剪掉最早的几轮message
+	compaction，自动压缩后填到上下文窗口同时将对话记录存到文件中保留LLM访问文件的路径权限
+策略4：隔离上下文
+	将不依赖任务上下文产生大量内容的任务交给子agent执行，做好状态隔离，agent拥有独立的上下文窗口
+	session隔离，同一个agent创建多个对话使用session-id隔离上下文
+策略5：结构化上下文
+	将自然语言上下文整理成结构化json格式，信息密度更大
+
+claude code的上下文控制：
+	claude code设计是四层渐进式压缩
+	1.Snip：删除历史对话中已经不再被引用的旧工具执行结果，使用占位符直接替代就结果
+	2.Microcompact：压缩单个工具执行结果，工具执行返回大量结果，截断最相关的少量结果
+	3.Context Collapse：所有执行消息分序列摘要，全文另存到内存中，摘要映射内存地址，引用摘要可以直接按路径访问到原文件
+	4.Autocompact：直接创建一个子agent生成整个对话的摘要
+	系统提示词：归属头+CLI提示词前缀+工具描述与prompt+工具搜索指令+顾问指令
+
+OpenAI Agents SDK上下文分层策略：
+	Instructions（传给模型的上下文）
+	RunContext（传给工具与钩子的上下文 = 依赖注入）
+
+用户中断agent执行的开发设计：
+	1.agent的执行生命周期按照节点划分，每个节点执行前检查状态，使用interrupt中断操作后，检查点、线程id记录中断点的状态机，重启任务直接在该检查点位置执行
+	2.设置工具调用幂等，使用trace_id、step_id记录任务id、节点id，使用去重键用于防止任务重复提交执行
+	3.状态机补偿，在一个节点中存在写入、提交工单等已经完成操作，需要设置用户中断操作后取消已提交工单、删除该节点写入内容（长agent任务设置状态机：待执行、执行中、部分完成、待人工确认、取消中、已取消、失败）
+	4.用户反馈执行状态，将执行了哪些动作得到哪些结果交给用户，例如：工单、审批单已提交无法撤回需要人工处理；同时在执行过程中需要使用langfuse记录节点执行状态以及执行结果，用户点击中断就要记录中断状态码，用于后续追溯
+
+
+三.harness工程
+	harness更加关注的设计是：1.模型什么时候调用；2.调用重试上限；3.工具注册与调用工具；4.工具调用失败处理；5.上下文处理；6.用户中断设计；7.如何验证llm、tool执行结果正确性，并判断什么时候重试；8.设定agent目标，判断返回结果达到什么条件可以终止；
+
+1.agent loop
+负责驱动agent持续完成任务、管理状态、上下文、工具、异常重试、终止条件和持久化运行循环控制
+用户请求---agent runtime（1.接受任务、加载state；2.创建恢复session；3.创建turn；4.构建context；5.调用模型，解析模型输出；6.判别使用tool；7.写入state；8.判断下一步任务；9.根据state判断结束条件；）---人机交互/tool result---loop
+（1）输入管理：管理用户请求、系统事件、工具结果、人机交互结果
+（2）会话管理：按照session记录对话、tool结果与llm返回等多个turn的执行记录，作为llm执行事实源（turn-id、step-id、checkpoint等）
+（3）上下文构建：在每一个llm执行节点前定义一个schema，按照该schema构建context
+（4）模型路由、条件路由：可以设计兜底路由防止主llm异常导致任务失败；根据复杂度选择不同模型
+（5）输出校验：验证llm节点输出内容来源在权限内，知识库检索、工具执行是否成功
+（6）决策工程：硬编码规则控制agnet执行，根据state、用户权限、重试策略等这些规则定义下一步执行
+（7）工具执行器：工具注册、权限划分、执行、返回结果
+（8）状态更新：tool执行结果由于更新state，state构建新context进行下一次LLM
+（9）中断管理：与上下工程中设计中断的操作一直，保证人机协作的可用性
+（10）重试策略：区分模型重试、工具重试、超时重试、网络重试、检验重试、服务忙碌重试
+（11）限制管理：模型响应、工具执行执行时间次数限制，设置max-step、max-turn、max-tool-retry、max-model-retry、context-limit
+（12）持久化：每一个步骤都要有时间记录和对应id记录，trace-id、step-id、audit、langfuse来实现
+
+agent-loop-engine/
+│
+├── core/
+│   ├── agent.py
+│   ├── loop.py
+│   ├── turn.py
+│   ├── step.py
+│   ├── state.py
+│   ├── context.py
+│   └── decision.py
+│
+├── model/
+│   ├── base.py
+│   ├── openai.py
+│   └── mock.py
+│
+├── tools/
+│   ├── registry.py
+│   ├── executor.py
+│   └── base.py
+│
+├── runtime/
+│   ├── session.py
+│   ├── checkpoint.py
+│   ├── interrupt.py
+│   ├── retry.py
+│   └── termination.py
+│
+├── observability/
+│   ├── event.py
+│   ├── logger.py
+│   └── trace.py
+│
+├── policy/
+│   ├── permission.py
+│   ├── tool_policy.py
+│   └── termination_policy.py
+│
+├── storage/
+│   ├── session_store.py
+│   └── checkpoint_store.py
+│
+└── main.py
+
+agent runtime：1.用户输入请求，创建request-id；2.为对话构建session-id、用户id、step-id等信息到runtime context中，用户请求到task state，创建state记录任务信息状态、记录外部业务对象状态信息；3.创建turn，context builder从runtime context、state、tool definition和knowledge context构建context到LLM，LLM任务拆解规划任务创建step（step不一定固定，LLM执行结束一步step根据状态决策会动态添加step），然后补充task state；4.context拼接提示词，注入到LLM中（不要把全部的state原封不动的交给LLM），生成tool call，验证用户权限和tool权限检查后，执行tool产生tool result，检验工具结果（验证工具结果字段完整性、类型正确性、合理性、一致性、时效性、可见性）；5.决策工程状态判断step状态，更新state，持久化事件记录，交给LLM结合state、context、Termination 条件继续规划任务执行（当前step执行、下一步step执行、重试、重规划、中断、结束）；6.下一步step执行；7.通过event log来持久化执行过程；8.验证结果满足终止条件，
+
+tool runtime：1.工具注册（tool registry）；2.工具声明（tool schema）；3.权限检查；4.输入验证；5.工具执行；6.返回结果解析、超时重试；7.输出验证；8.状态更新；9.执行日志审计
+
+Deepseek harness循环设计turn、step两个层级，turn：一次交互产生多个连续step；step：一次llm的决策推进
+例子：用户输入：‘帮我计算项目 P001 下个月的产能需求’
+	agent执行：step001.用户请求-llm-BOM查询-tool result；step002.llm-工艺路线查询-tool result；step003.llm-产能计算-tool result；step004.llm-最终回答
+	agent loop每一步都应该问agnet现在还差什么工作，用户请求计算产能，那么刚开始agent还欠 查询bom、查询工艺、计算产能、输出结果 ；当执行bom查询后就还欠 查询工艺、计算产能、输出结果；直到agent什么都不欠，turn才算执行结束
+
+注意点：
+工具描述并不是直接拼接到上下文中，应该设计成先权限过滤、任务可用工具过滤、相似工具选择后将剩下的工具描述传入上下文中
+严格区分工具执行超时、step 超时、会话超时，用户取消、系统取消，人工审核中断、外部事件中断、安全审核中断，大模型重试、工具执行重试、网络连接重试，区分清楚成功、部分成功、失败、执行超时、未知等多种执行状态，返回不同的错误状态码要有不同的处理措施或是抛出异常或是重试
+循环工程设定结果中止条件，不可以只用工具、LLM的返回状态作为条件，而是需要设定查询系统、实际生成内容检查确认任务id、工具id、用户id、时间戳等
+
+2.context runtime
+上下文运行时主要内容在上下文工程中已经有介绍，包含（1）上下文聚合策略即llm节点schema声明使用contextbulider构建节点上下文；（2）上下文管理策略即上下文裁剪、压缩等原理；（3）上下文的token budget计算上下文的token用量
+
+3.tool runtime
+（1）工具注册（tool registry）；（2）工具声明（tool schema）；（3）权限检查；（4）输入验证；（5）工具执行；（6）返回结果解析、超时重试；（7）输出验证；（8）状态更新；（9）执行日志审计
+
+4.harness和langchain开发框架的联系
+agent loop：create_agent；模型：chatmodel；工具：@tool；状态：Agent State；运行上下文：Runtime；记忆：store+Memory Middleware；短期记忆：Checkpointer+saver；长期记忆：store；动态提示词、工具策略、重试策略：Middleware；中断策略：interrupt（）；Resume：Command(resume=...)；持久化：检查点+thread-id+resume恢复执行，使用trace-id、step-id幂等工具执行记录；输出：stream（）/astream（）/invoke（）/stream-event（）；结构化输出：response-format/With Structured Output；工具调用校验：tool schema+Middleware；可观测性：Langfuse；生命周期：Runtime设计
+harness实现都可以通过langchain中的Middleware实现，如输入格式验证、人机交互设计、输出数据脱敏、动态上下文拼接、工具LLM执行重试等；短期记忆：通过checkpointer+thread-id实现；事件流输出：stream-events；中断点设计：interrupt，具体暂停恢复的设计需要通过harness参考幂等设计防重复执行；设定终止条件：不允许设计LLM自己决定任务完成，设计其他系统返回状态、实际状态检查工具来判断任务结束
+
+四.产值agent实际开发方案架构设计
+
+
+五.用户体验优化
+	注重ui界面设计、选择不同SDK的事件流式输出，从API调用到UI渲染，全流程用户使用async function*异步生成器
+	传统流式输出等模型响应结束，解析出来工具调用，逐个执行发送结果；claude则是模型还在生成文字的同时，解析已完整生成的tool call并执行
+	
